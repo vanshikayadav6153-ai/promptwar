@@ -1,0 +1,28 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://paypal-hackathon-s0gq.onrender.com/api/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "https://paypal-hackathon-s0gq.onrender.com/health"
+    },
+    {
+      "source": "/docs",
+      "destination": "https://paypal-hackathon-s0gq.onrender.com/docs"
+    },
+    {
+      "source": "/openapi.json",
+      "destination": "https://paypal-hackathon-s0gq.onrender.com/openapi.json"
+    },
+    {
+      "source": "/redoc",
+      "destination": "https://paypal-hackathon-s0gq.onrender.com/redoc"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

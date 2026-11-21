@@ -1,0 +1,14 @@
+.DS_Store
+node_modules/
+.venv/
+venv/
+.env
+.next/
+dist/
+build/
+*.dmg
+*.crdownload
+*.zip
+*.mp4
+*.pkg
+server/payments_db.json

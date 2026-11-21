@@ -1,0 +1,333 @@
+import re
+import time
+import uuid
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+from backend.app.core.config import settings
+from backend.app.core.exceptions import PayPalApiException
+from backend.app.core.logging import logger
+
+PAYPAL_CERT_URL_REGEX = re.compile(
+    r"^https://api(\.sandbox)?\.paypal\.com/v1/notifications/certs/[A-Za-z0-9\-_]+$"
+)
+
+ALLOWED_REDIRECT_DOMAINS = {
+    "localhost",
+    "127.0.0.1",
+    "paypal-hackathon-mu.vercel.app"
+}
+
+
+class PayPalGateway:
+    def __init__(self):
+        self._access_token: str | None = None
+        self._token_expires_at: float = 0.0
+
+    @property
+    def is_configured(self) -> bool:
+        return (
+            bool(settings.PAYPAL_CLIENT_ID)
+            and settings.PAYPAL_CLIENT_ID != "replace-with-sandbox-client-id"
+            and settings.PAYPAL_CLIENT_ID != "sandbox_client_id_placeholder"
+            and bool(settings.PAYPAL_CLIENT_SECRET)
+            and settings.PAYPAL_CLIENT_SECRET != "replace-with-sandbox-client-secret"
+            and settings.PAYPAL_CLIENT_SECRET != "sandbox_client_secret_placeholder"
+        )
+
+    async def get_access_token(self) -> str:
+        """Fetch and cache OAuth 2.0 bearer token using client credentials."""
+        now = time.time()
+        if self._access_token and now < (self._token_expires_at - 60):
+            return self._access_token
+
+        if not self.is_configured:
+            # Deterministic sandbox mock token for unit tests/dry-runs
+            self._access_token = f"sandbox_simulated_token_{uuid.uuid4().hex[:8]}"
+            self._token_expires_at = now + 3600
+            return self._access_token
+
+        auth_url = f"{settings.paypal_base_url}/v1/oauth2/token"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    auth_url,
+                    auth=(settings.PAYPAL_CLIENT_ID, settings.PAYPAL_CLIENT_SECRET),
+                    data={"grant_type": "client_credentials"},
+                    headers={"Accept": "application/json", "Accept-Language": "en_US"}
+                )
+                if resp.status_code != 200:
+                    raise PayPalApiException(f"Failed to obtain OAuth token from PayPal: {resp.text}")
+                
+                data = resp.json()
+                token = str(data["access_token"])
+                self._access_token = token
+                expires_in = data.get("expires_in", 32400)
+                self._token_expires_at = now + expires_in
+                logger.info("Successfully fetched fresh PayPal Sandbox OAuth access token.")
+                return token
+        except Exception as e:
+            if isinstance(e, PayPalApiException):
+                raise
+            raise PayPalApiException(f"Network error during PayPal OAuth: {e!s}") from e
+
+    def _is_safe_redirect_url(self, url: str | None) -> bool:
+        if not url:
+            return False
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return False
+            hostname = parsed.hostname or ""
+            if hostname in ALLOWED_REDIRECT_DOMAINS or hostname.endswith(".vercel.app"):
+                return True
+            frontend_host = urlparse(settings.FRONTEND_URL).hostname
+            return bool(frontend_host and hostname == frontend_host)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def create_order(
+        self,
+        amount: float,
+        currency: str,
+        session_id: str,
+        return_url: str | None = None,
+        cancel_url: str | None = None
+    ) -> dict[str, Any]:
+        """Create a PayPal Sandbox order with intent: CAPTURE."""
+        if return_url and self._is_safe_redirect_url(return_url):
+            ret_url = return_url
+        else:
+            ret_url = f"{settings.FRONTEND_URL}/checkout/success?session_id={session_id}"
+
+        if cancel_url and self._is_safe_redirect_url(cancel_url):
+            cnc_url = cancel_url
+        else:
+            cnc_url = f"{settings.FRONTEND_URL}/checkout/cancel?session_id={session_id}"
+        formatted_amount = f"{amount:.2f}"
+
+        if not self.is_configured:
+            # Deterministic sandbox simulation mode
+            simulated_order_id = f"ORDER-SANDBOX-{uuid.uuid4().hex[:8].upper()}"
+            simulated_approval_url = f"https://www.sandbox.paypal.com/checkoutnow?token={simulated_order_id}"
+            logger.info(f"[SIMULATED SANDBOX] Created PayPal order {simulated_order_id} for amount ${formatted_amount} {currency}")
+            return {
+                "id": simulated_order_id,
+                "status": "CREATED",
+                "approval_url": simulated_approval_url
+            }
+
+        token = await self.get_access_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "PayPal-Request-Id": str(uuid.uuid4())
+        }
+
+        payload = {
+            "intent": "CAPTURE",
+            "purchase_units": [
+                {
+                    "reference_id": session_id,
+                    "description": "PayMesh AI Machine-Readable Data Entitlement",
+                    "custom_id": session_id,
+                    "amount": {
+                        "currency_code": currency,
+                        "value": formatted_amount
+                    }
+                }
+            ],
+            "application_context": {
+                "brand_name": "PayMesh AI Commerce",
+                "landing_page": "NO_PREFERENCE",
+                "user_action": "PAY_NOW",
+                "return_url": ret_url,
+                "cancel_url": cnc_url
+            }
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{settings.paypal_base_url}/v2/checkout/orders",
+                headers=headers,
+                json=payload
+            )
+            if resp.status_code not in (200, 201):
+                logger.error(f"PayPal order creation failed: {resp.text}")
+                raise PayPalApiException(f"PayPal order creation failed: {resp.text}")
+
+            data = resp.json()
+            approval_url = None
+            for link in data.get("links", []):
+                if link.get("rel") == "approve":
+                    approval_url = link.get("href")
+                    break
+
+            if not approval_url:
+                approval_url = f"https://www.sandbox.paypal.com/checkoutnow?token={data['id']}"
+
+            return {
+                "id": data["id"],
+                "status": data["status"],
+                "approval_url": approval_url
+            }
+
+    async def get_order(self, paypal_order_id: str) -> dict[str, Any]:
+        """Fetch current order details and status from PayPal Orders v2 API."""
+        if not self.is_configured:
+            return {"id": paypal_order_id, "status": "APPROVED"}
+
+        token = await self.get_access_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{settings.paypal_base_url}/v2/checkout/orders/{paypal_order_id}",
+                headers=headers
+            )
+            if resp.status_code != 200:
+                raise PayPalApiException(f"Failed to fetch PayPal order {paypal_order_id}: {resp.text}")
+            return resp.json()
+
+    async def capture_order(self, paypal_order_id: str) -> dict[str, Any]:
+        """Capture an approved PayPal order and verify COMPLETED status."""
+        if not self.is_configured:
+            # Deterministic sandbox simulation mode
+            simulated_capture_id = f"CAP-SANDBOX-{uuid.uuid4().hex[:8].upper()}"
+            logger.info(f"[SIMULATED SANDBOX] Captured PayPal order {paypal_order_id} with capture ID {simulated_capture_id}")
+            return {
+                "id": paypal_order_id,
+                "status": "COMPLETED",
+                "capture_id": simulated_capture_id,
+                "raw_response": {"status": "COMPLETED", "capture_id": simulated_capture_id, "simulated": True}
+            }
+
+        token = await self.get_access_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "PayPal-Request-Id": str(uuid.uuid4())
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{settings.paypal_base_url}/v2/checkout/orders/{paypal_order_id}/capture",
+                headers=headers
+            )
+            if resp.status_code not in (200, 201):
+                err_text = resp.text
+                if "ORDER_NOT_APPROVED" in err_text:
+                    logger.warning(f"PayPal order {paypal_order_id} is pending buyer approval at PayPal Sandbox.")
+                    raise PayPalApiException(
+                        f"PayPal order {paypal_order_id} has not been approved by the buyer. "
+                        "Please complete approval at the PayPal approval URL before capturing.",
+                        details={"error": "ORDER_NOT_APPROVED", "paypal_order_id": paypal_order_id}
+                    )
+                logger.error(f"PayPal order capture failed for order {paypal_order_id}: {err_text}")
+                raise PayPalApiException(f"PayPal order capture failed: {err_text}")
+
+            data = resp.json()
+            order_status = data.get("status")
+            if order_status != "COMPLETED":
+                raise PayPalApiException(f"Order status is not COMPLETED (status: {order_status})")
+
+            # Extract capture ID from purchase units
+            capture_id = None
+            purchase_units = data.get("purchase_units", [])
+            if purchase_units:
+                payments = purchase_units[0].get("payments", {})
+                captures = payments.get("captures", [])
+                if captures:
+                    capture_id = captures[0].get("id")
+
+            if not capture_id:
+                capture_id = f"CAP-{paypal_order_id}"
+
+            return {
+                "id": paypal_order_id,
+                "status": order_status,
+                "capture_id": capture_id,
+                "raw_response": data
+            }
+
+    async def verify_webhook_signature(
+        self,
+        headers: dict[str, str],
+        body: dict[str, Any]
+    ) -> bool:
+        """
+        Verify incoming webhook signature with PayPal Notifications API:
+        POST /v1/notifications/verify-webhook-signature
+        """
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        cert_url = norm_headers.get("paypal-cert-url")
+
+        if not self.is_configured:
+            # When testing locally with test fixtures, verify transmission headers are present
+            has_transmission_id = any(
+                k.lower() == "paypal-transmission-id" for k in headers
+            )
+            # Enforce that if cert_url is provided, it must match the PayPal cert host pattern
+            if cert_url and not PAYPAL_CERT_URL_REGEX.match(cert_url):
+                logger.warning(f"Incoming webhook rejected: invalid or untrusted paypal-cert-url: {cert_url}")
+                return False
+            return has_transmission_id
+
+        webhook_id = settings.PAYPAL_WEBHOOK_ID
+        if not webhook_id:
+            logger.warning("PAYPAL_WEBHOOK_ID is not configured; cannot verify signature.")
+            return False
+
+        auth_algo = norm_headers.get("paypal-auth-algo")
+        transmission_id = norm_headers.get("paypal-transmission-id")
+        transmission_sig = norm_headers.get("paypal-transmission-sig")
+        transmission_time = norm_headers.get("paypal-transmission-time")
+
+        if not all([auth_algo, cert_url, transmission_id, transmission_sig, transmission_time]):
+            logger.warning("Incoming webhook missing required PayPal transmission verification headers.")
+            return False
+
+        if not cert_url or not PAYPAL_CERT_URL_REGEX.match(cert_url):
+            logger.warning(f"Incoming webhook rejected: invalid or untrusted paypal-cert-url: {cert_url}")
+            return False
+
+        token = await self.get_access_token()
+        verify_url = f"{settings.paypal_base_url}/v1/notifications/verify-webhook-signature"
+        payload = {
+            "auth_algo": auth_algo,
+            "cert_url": cert_url,
+            "transmission_id": transmission_id,
+            "transmission_sig": transmission_sig,
+            "transmission_time": transmission_time,
+            "webhook_id": webhook_id,
+            "webhook_event": body
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    verify_url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {token}"
+                    },
+                    json=payload
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status_val = data.get("verification_status")
+                    is_valid = status_val == "SUCCESS"
+                    if not is_valid:
+                        logger.warning(f"PayPal webhook signature rejected by PayPal API: {data}")
+                    return is_valid
+                logger.error(f"PayPal webhook verification API returned HTTP {resp.status_code}: {resp.text}")
+                return False
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Network error during PayPal webhook signature verification: {e!s}")
+            return False
+
+paypal_gateway = PayPalGateway()
